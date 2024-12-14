@@ -9,6 +9,15 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers import PretrainedConfig
 from transformers import GenerationConfig
+import torch.nn.functional as F
+from typing import List
+
+from transformers.utils import is_flash_attn_2_available
+
+
+if is_flash_attn_2_available():
+    from flash_attn import flash_attn_func, flash_attn_varlen_func
+    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
 @dataclass
 class Config:
@@ -29,6 +38,11 @@ class Config:
     add_bias_linear: bool = False  # The linear layers in the FFN do not have bias terms.
 
     is_encoder_decoder: bool = False
+    apply_residual_connection_post_layernorm: bool = False
+    apply_query_key_layer_scaling: bool = True
+    attention_softmax_in_fp32: bool = True
+    attention_dropout: float = 0.0
+    hidden_dropout: float = 0.0
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, rope_ratio=1, original_impl=False, device=None, dtype=None):
@@ -90,37 +104,54 @@ def apply_rotary_pos_emb(x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Ten
     x_out2 = x_out2.flatten(3)
     return torch.cat((x_out2, x_pass), dim=-1)
 
-
-
-# TODO: Implement the RMSNorm class.
-class RMSNorm(torch.nn.Module):
+class RMSNorm(nn.Module):
     def __init__(self, normalized_shape, eps=1e-5, device=None, dtype=None, **kwargs):
-        super().__init__()
+        super(RMSNorm, self).__init__()
+        self.normalized_shape = normalized_shape
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.ones(normalized_shape, device=device, dtype=dtype))
 
     def forward(self, hidden_states: torch.Tensor):
+        input_dtype = hidden_states.dtype
+        rms = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(rms + self.eps)
+        return (self.gamma * hidden_states).to(input_dtype)
 
 
-# TODO: Implement the Attention class.
 class Attention(torch.nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_number):
         super(Attention, self).__init__()
         self.config = config
+        self.layer_number = layer_number
         self.is_causal = True
-
+        # 计算投影尺寸
         projection_size = config.kv_channels * config.num_attention_heads
 
-        # Per attention head and per partition values.
+        # 每层的维度计算
         self.hidden_size_per_partition = projection_size
         self.hidden_size_per_attention_head = projection_size // config.num_attention_heads
         self.num_attention_heads_per_partition = config.num_attention_heads
 
         self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
+        coeff = self.layer_number
+        self.norm_factor *= coeff
+        self.coeff = coeff
+
+        self.attention_dropout = torch.nn.Dropout(config.attention_dropout)
 
     def forward(self, query_layer, key_layer, value_layer, attention_mask):
-        # query, key, value layer [batch, number_heads, sequence_length, hidden_size_per_head]
+        # [b, np, sq, sk]
+        output_size = (query_layer.size(0), query_layer.size(1), query_layer.size(2), key_layer.size(2))
+        query_layer = query_layer.view(output_size[0] * output_size[1], output_size[2], -1)
+        key_layer = key_layer.view(output_size[0] * output_size[1], output_size[3], -1)
 
+        # 计算注意力得分并进行缩放
+        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+        attention_scores /= self.norm_factor
 
-        # attention scores and attention mask [batch, number_heads, sequence_length, sequence_length]
+        attention_scores = attention_scores.view(*output_size)
+
+        attention_scores = attention_scores.float() * self.coeff
         if attention_mask is None and attention_scores.shape[2] == attention_scores.shape[3]:
             attention_mask = torch.ones(output_size[0], 1, output_size[2], output_size[3],
                                         device=attention_scores.device, dtype=torch.bool)
@@ -128,133 +159,356 @@ class Attention(torch.nn.Module):
             attention_mask = ~attention_mask
         if attention_mask is not None:
             attention_scores = attention_scores.masked_fill(attention_mask, float("-inf"))
+        attention_probs = F.softmax(attention_scores, dim=-1)
+        attention_probs = attention_probs.type_as(value_layer)
 
+        attention_probs = self.attention_dropout(attention_probs)
 
-        # context_layer [batch, sequence_length, hidden_size]
+        output_size = (value_layer.size(0), value_layer.size(1), query_layer.size(1), value_layer.size(3))
+        value_layer = value_layer.view(output_size[0] * output_size[1], value_layer.size(2), -1)
+        attention_probs = attention_probs.view(output_size[0] * output_size[1], output_size[2], -1)
+        context_layer = torch.bmm(attention_probs, value_layer)
+        context_layer = context_layer.view(*output_size)
+        context_layer = context_layer.transpose(1, 2).contiguous()
+        new_context_layer_shape = context_layer.size()[:-2] + (self.hidden_size_per_partition,)
+        context_layer = context_layer.reshape(*new_context_layer_shape)
+
         return context_layer
 
 
-# TODO: Implement the AttentionBlock class.
+def split_tensor_along_last_dim(
+        tensor: torch.Tensor,
+        num_partitions: int,
+        contiguous_split_chunks: bool = False,
+) -> List[torch.Tensor]:
+    last_dim = tensor.dim() - 1
+    last_dim_size = tensor.size()[last_dim] // num_partitions
+    # Split.
+    tensor_list = torch.split(tensor, last_dim_size, dim=last_dim)
+    # Note: torch.split does not create contiguous tensors by default.
+    if contiguous_split_chunks:
+        return tuple(chunk.contiguous() for chunk in tensor_list)
+
+    return tensor_list
+
+def _get_unpad_data(attention_mask):
+    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+    max_seqlen_in_batch = seqlens_in_batch.max().item()
+    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
+    return (
+        indices,
+        cu_seqlens,
+        max_seqlen_in_batch,
+    )
+
+class FlashAttention2(Attention):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._flash_attn_uses_top_left_mask = False
+
+    def forward(self, query_states, key_states, value_states, attention_mask):
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+        batch_size, query_length = query_states.shape[:2]
+        if not self._flash_attn_uses_top_left_mask:
+            causal = self.is_causal
+        else:
+            causal = self.is_causal and query_length != 1
+        dropout = self.config.attention_dropout if self.training else 0.0
+        # Contains at least one padding token in the sequence
+        if attention_mask is not None:
+            query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
+                query_states, key_states, value_states, attention_mask, query_length
+            )
+
+            cu_seqlens_q, cu_seqlens_k = cu_seq_lens
+            max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
+
+            attn_output_unpad = flash_attn_varlen_func(
+                query_states,
+                key_states,
+                value_states,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_in_batch_q,
+                max_seqlen_k=max_seqlen_in_batch_k,
+                dropout_p=dropout,
+                softmax_scale=None,
+                causal=causal,
+            )
+
+            attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
+        else:
+            attn_output = flash_attn_func(
+                query_states, key_states, value_states, dropout, softmax_scale=None, causal=causal
+            )
+        attn_output = attn_output.reshape(batch_size, query_length, self.hidden_size_per_partition).contiguous()
+        return attn_output
+
+    def _upad_input(self, query_layer, key_layer, value_layer, attention_mask, query_length):
+        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
+        batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
+
+        key_layer = index_first_axis(
+            key_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
+        )
+        value_layer = index_first_axis(
+            value_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim), indices_k
+        )
+        if query_length == kv_seq_len:
+            query_layer = index_first_axis(
+                query_layer.reshape(batch_size * kv_seq_len, self.num_attention_heads_per_partition, head_dim),
+                indices_k
+            )
+            cu_seqlens_q = cu_seqlens_k
+            max_seqlen_in_batch_q = max_seqlen_in_batch_k
+            indices_q = indices_k
+        elif query_length == 1:
+            max_seqlen_in_batch_q = 1
+            cu_seqlens_q = torch.arange(
+                batch_size + 1, dtype=torch.int32, device=query_layer.device
+            )  # There is a memcpy here, that is very bad.
+            indices_q = cu_seqlens_q[:-1]
+            query_layer = query_layer.squeeze(1)
+        else:
+            # The -q_len: slice assumes left padding.
+            attention_mask = attention_mask[:, -query_length:]
+            query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(query_layer, attention_mask)
+
+        return (
+            query_layer,
+            key_layer,
+            value_layer,
+            indices_q,
+            (cu_seqlens_q, cu_seqlens_k),
+            (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
+        )
+
+
 class AttentionBlock(torch.nn.Module):
-    """Parallel self-attention layer abstract class.
-    Self-attention layer takes input with size [s, b, h]
-    and returns output of the same size.
-    """
 
-    def __init__(self, config, device=None, dtype=torch.bfloat16):
+    def __init__(self, config, layer_number, device=None, dtype=torch.bfloat16):
         super(AttentionBlock, self).__init__()
-
-        self.dtype = dtype
         self.projection_size = config.kv_channels * config.num_attention_heads
-
+        self.layer_number = layer_number
         # Per attention head and per partition values.
-        self.hidden_size_per_attention_head = self.projection_size // config.num_attention_heads
+        self.hidden_size_per_attention_head = self.projection_size // config.num_attention_heads # 每个头的键值维度
         self.num_attention_heads_per_partition = config.num_attention_heads
 
         self.multi_query_attention = config.multi_query_attention
         self.qkv_hidden_size = 3 * self.projection_size
+        # 计算QKV隐藏层大小
         if self.multi_query_attention:
             self.num_multi_query_groups_per_partition = config.multi_query_group_num
             self.qkv_hidden_size = (
                     self.projection_size + 2 * self.hidden_size_per_attention_head * config.multi_query_group_num
             )
+        # 定义qkv共用参数
+        self.query_key_value = nn.Linear(config.hidden_size, self.qkv_hidden_size,
+                                         bias=config.add_bias_linear or config.add_qkv_bias,
+                                         device=device, dtype=dtype
+                                         )
 
-
-        self.core_attention = Attention(config)
+        # Attention算子
+        self.core_attention = FlashAttention2(config, self.layer_number)
+        self.dense = nn.Linear(self.projection_size, config.hidden_size, bias=config.add_bias_linear,
+                               device=device, dtype=dtype
+                               )
 
     def forward(
             self, hidden_states, attention_mask, rotary_pos_emb, kv_cache=None, use_cache=True
     ):
-
+        # 计算qkv投影，并分割为query, key, value
         mixed_x_layer = self.query_key_value(hidden_states)
 
-        (query_layer, key_layer, value_layer) = mixed_x_layer.split(
-            [
-                self.num_attention_heads_per_partition * self.hidden_size_per_attention_head,
-                self.num_multi_query_groups_per_partition * self.hidden_size_per_attention_head,
-                self.num_multi_query_groups_per_partition * self.hidden_size_per_attention_head,
-            ],
-            dim=-1,
-        )
-        query_layer = query_layer.view(
-            query_layer.size()[:-1] + (self.num_attention_heads_per_partition, self.hidden_size_per_attention_head)
-        )
-        key_layer = key_layer.view(
-            key_layer.size()[:-1] + (self.num_multi_query_groups_per_partition, self.hidden_size_per_attention_head)
-        )
-        value_layer = value_layer.view(
-            value_layer.size()[:-1]
-            + (self.num_multi_query_groups_per_partition, self.hidden_size_per_attention_head)
-        )
+        if self.multi_query_attention:
+            (query_layer, key_layer, value_layer) = mixed_x_layer.split(
+                [
+                    self.num_attention_heads_per_partition * self.hidden_size_per_attention_head,
+                    self.num_multi_query_groups_per_partition * self.hidden_size_per_attention_head,
+                    self.num_multi_query_groups_per_partition * self.hidden_size_per_attention_head,
+                ],
+                dim=-1,
+            )
+            query_layer = query_layer.view(
+                query_layer.size()[:-1] + (self.num_attention_heads_per_partition, self.hidden_size_per_attention_head)
+            )
+            key_layer = key_layer.view(
+                key_layer.size()[:-1] + (self.num_multi_query_groups_per_partition, self.hidden_size_per_attention_head)
+            )
+            value_layer = value_layer.view(
+                value_layer.size()[:-1]
+                + (self.num_multi_query_groups_per_partition, self.hidden_size_per_attention_head)
+            )
+        else:
+            new_tensor_shape = mixed_x_layer.size()[:-1] + \
+                               (self.num_attention_heads_per_partition,
+                                3 * self.hidden_size_per_attention_head)
+            mixed_x_layer = mixed_x_layer.view(*new_tensor_shape)
+
+            # [b, sq, np, 3 * hn] --> 3 [b, sq, np, hn]
+            (query_layer, key_layer, value_layer) = split_tensor_along_last_dim(mixed_x_layer, 3)
 
         query_layer, key_layer, value_layer = [k.transpose(1, 2) for k in [query_layer, key_layer, value_layer]]
 
-        # apply relative positional encoding (rotary embedding)
+        # 位置编码
         if rotary_pos_emb is not None:
             query_layer = apply_rotary_pos_emb(query_layer, rotary_pos_emb)
             key_layer = apply_rotary_pos_emb(key_layer, rotary_pos_emb)
 
-        # TODO
+        # adjust key and value for inference
+        if kv_cache is not None:
+            cache_k, cache_v = kv_cache
+            key_layer = torch.cat((cache_k, key_layer), dim=2)
+            value_layer = torch.cat((cache_v, value_layer), dim=2)
+        if use_cache:
+            if kv_cache is None:
+                kv_cache = torch.cat((key_layer.unsqueeze(0).unsqueeze(0), value_layer.unsqueeze(0).unsqueeze(0)),
+                                     dim=1)
+            else:
+                kv_cache = (key_layer, value_layer)
+        else:
+            kv_cache = None
 
+        if self.multi_query_attention:
+            key_layer = key_layer.unsqueeze(2)
+            key_layer = key_layer.expand(
+                -1, -1, self.num_attention_heads_per_partition // self.num_multi_query_groups_per_partition, -1, -1
+            )
+            key_layer = key_layer.contiguous().view(
+                key_layer.size()[:1] + (self.num_attention_heads_per_partition,) + key_layer.size()[3:]
+            )
+            value_layer = value_layer.unsqueeze(2)
+            value_layer = value_layer.expand(
+                -1, -1, self.num_attention_heads_per_partition // self.num_multi_query_groups_per_partition, -1, -1
+            )
+            value_layer = value_layer.contiguous().view(
+                value_layer.size()[:1] + (self.num_attention_heads_per_partition,) + value_layer.size()[3:]
+            )
+        # 合并多头输出，并通过最终线性层
         context_layer = self.core_attention(query_layer, key_layer, value_layer, attention_mask)
+        output = self.dense(context_layer)
 
-        # TODO
-
-        # =================
-        # Output. [sequence_length, batch, hidden size]
-        # =================
-        return output, new_kv_cache
+        return output, kv_cache
 
 
-# TODO: Implement the MLP class.
 class MLP(torch.nn.Module):
-    """MLP.
-    MLP will take the input with h hidden state, project it to 4*h
-    hidden dimension, perform nonlinear transformation, and project the
-    state back into h hidden dimension.
-    """
-
     def __init__(self, config, device=None, dtype=torch.bfloat16):
         super(MLP, self).__init__()
 
-    def forward(self, hidden_states):
+        self.add_bias = config.add_bias_linear
+        self.fc1 = nn.Linear(
+            config.hidden_size,
+            config.ffn_hidden_size * 2,
+            bias=self.add_bias,
+            device=device,
+            dtype=dtype
+        )
 
+        self.fc2 = nn.Linear(
+            config.ffn_hidden_size,
+            config.hidden_size,
+            bias=self.add_bias,
+            device=device,
+            dtype=dtype
+        )
+
+    def forward(self, hidden_states):
+        # [s, b, 4hp]
+        x = self.fc1(hidden_states)
+        x_g, x_l = x.chunk(2, dim=-1)
+        x = F.silu(x_g) * x_l
+        output = self.fc2(x)
         return output
 
-# TODO: Implement the Layer class.
 class Layer(torch.nn.Module):
-    def __init__(self, config, device):
+    def __init__(self, config, device, layer_number):
         super(Layer, self).__init__()
         self.dtype = torch.bfloat16 if config.torch_dtype == "bfloat16" else torch.float32
-        self.self_attention = AttentionBlock(config, device=device, dtype=self.dtype)
+        self.self_attention = AttentionBlock(config, layer_number, device=device, dtype=self.dtype)
+        self.mlp = MLP(config, device=device, dtype=self.dtype)
+
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.layernorm_epsilon,
+            device=device,
+            dtype=self.dtype)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.layernorm_epsilon,
+            device=device,
+            dtype=self.dtype)
 
     def forward(
             self, hidden_states, attention_mask, rotary_pos_emb, kv_cache=None, use_cache=True,
     ):
-        # hidden_states: [sequence_length, batch, hidden size]
+        layernorm_output = self.input_layernorm(hidden_states)
+        attention_output, new_kv_cache = self.self_attention(
+            layernorm_output, attention_mask, rotary_pos_emb, kv_cache, use_cache
+        )
 
+        residual_connection = hidden_states + attention_output
+        normed_residual_connection = self.post_attention_layernorm(residual_connection)
 
-        # output: [sequence_length, batch, hidden size]
+        ffn_output = self.mlp(normed_residual_connection)
+        output = residual_connection + ffn_output
+
         return output, new_kv_cache
 
-# TODO: Implement the Transformer class.
+
 class Transformer(torch.nn.Module):
     def __init__(self, config, device):
         super(Transformer, self).__init__()
         self.num_layers = config.num_layers
         self.post_layer_norm = config.post_layer_norm
+        self.dtype = torch.bfloat16 if config.torch_dtype == "bfloat16" else torch.float32
+        self.layers = nn.ModuleList([Layer(config, device, _ + 1) for _ in range(self.num_layers)])
 
+        if self.post_layer_norm:
+            self.final_layernorm = RMSNorm(
+                config.hidden_size,
+                eps=config.layernorm_epsilon,
+                device=device,
+                dtype=self.dtype
+            )
 
     def forward(
             self, hidden_states, attention_mask, rotary_pos_emb, kv_caches=None,
             use_cache: Optional[bool] = True,
             output_hidden_states: Optional[bool] = False,
     ):
+        # 存储每一层隐藏状态
+        all_hidden_states = [] if output_hidden_states else None
 
-        # new_kv_caches is a tuple
-        # length: num_layers, each element is a tuple of length 2 (key, value cache)
-        # key shape: [batch, multi_query_group_num, seq_len, kv_channels]
-        return hidden_states, new_kv_caches
+        # 初始化kv cache
+        new_kv_caches = [] if kv_caches is not None else None
+
+        for layer_idx, layer in enumerate(self.layers):
+            if output_hidden_states:
+                all_hidden_states.append(hidden_states)
+
+            # 如果已有kv cache
+            layer_kv_cache = kv_caches[layer_idx] if kv_caches is not None else None
+            # 前向传播
+            hidden_states, new_layer_kv_cache = layer(
+                hidden_states, attention_mask, rotary_pos_emb,
+                kv_cache=layer_kv_cache, use_cache=use_cache
+            )
+            # 保存新的kv cache
+            if new_kv_caches is not None:
+                new_kv_caches.append(new_layer_kv_cache)
+        
+        if self.post_layer_norm:
+            hidden_states = self.final_layernorm(hidden_states)
+        if output_hidden_states:
+            all_hidden_states.append(hidden_states)
+
+        if new_kv_caches is not None:
+            return hidden_states, tuple(new_kv_caches)
+        else:
+            return hidden_states, None
 
 
 class GLM4(torch.nn.Module):
@@ -465,33 +719,51 @@ def convert_ckpt():
     model_dict = huggingface_model.state_dict()
     new_model_dict = {}
     for k, v in model_dict.items():
-        pass
+        if k == "transformer.embedding.word_embeddings.weight":
+            new_model_dict["transformer.word_embedding.weight"] = v
+        elif k == "transformer.rotary_pos_emb.inv_freq":
+            new_model_dict["transformer.rotary_pos_emb.inv_freq"] = v
+        elif "transformer.encoder.layers" in k:
+            new_k = k.replace("transformer.encoder.layers", "transformer.model.layers")
+            new_k = new_k.replace("mlp.dense_h_to_4h", "mlp.fc1")
+            new_k = new_k.replace("mlp.dense_4h_to_h", "mlp.fc2")
+            new_k = new_k.replace("input_layernorm.weight", "input_layernorm.gamma")
+            new_k = new_k.replace("post_attention_layernorm.weight", "post_attention_layernorm.gamma")
+            new_model_dict[new_k] = v
+        elif k == "transformer.encoder.final_layernorm.weight":
+            new_model_dict["transformer.model.final_layernorm.gamma"] = v
+        else:
+            new_model_dict[k] = v
+
     torch.save(new_model_dict, "glm4.pt")
 
 
 if __name__ == "__main__":
-    os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # 设置 GPU 编号，如果单机单卡指定一个，单机多卡指定多个 GPU 编号
+    # 设置 GPU 编号，如果单机单卡指定一个，单机多卡指定多个 GPU 编号
+    os.environ['CUDA_VISIBLE_DEVICES'] = '5' 
     MODEL_PATH = "THUDM/glm-4-9b-chat"
 
+    # 设置Cuda device并使用gpm4的tokenizer
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
 
+    # 定义输入
     query = "你好"
-
     inputs = tokenizer.apply_chat_template([{"role": "user", "content": query}],
                                            add_generation_prompt=True,
                                            tokenize=True,
                                            return_tensors="pt",
                                            return_dict=True
                                            )
-
     inputs = inputs.to(device)
+
+    # 创建自定义的glm4模型实例
     model = ChatGLMForConditionalGeneration(config=Config(), device=device).eval()
 
-    convert_ckpt()
-
-    model.load_state_dict(torch.load("glm4.pt"))
+    # 下载hugging-face上的glm4模型，改为自定义模型格式的权重，并dump
+    # convert_ckpt()
+    # 自定义的glm4类加载模型权重
+    model.load_state_dict(torch.load("glm4.pt", weights_only=True))
 
     generation_config = GenerationConfig(
         eos_token_id=[151329,151336,151338],
@@ -502,7 +774,6 @@ if __name__ == "__main__":
         top_p= 0.8,
         top_k= 1,
         transformers_version= "4.44.0")
-
 
     with torch.no_grad():
         outputs = model.generate(**inputs, generation_config=generation_config)
