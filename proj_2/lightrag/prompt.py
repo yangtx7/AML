@@ -172,8 +172,46 @@ Do not include information where the supporting evidence for it is not provided.
 
 {context_data}
 
-Add sections and commentary to the response as appropriate for the length and format. Style the response in markdown.
+Add sections and commentary to the response as appropriate for the length and format. Style the response in markdown. 
 """
+
+# PROMPTS["rag_response"] = """---Role---
+
+# You are a helpful assistant responding to questions about data in the tables provided.
+
+# ---Goal---
+
+# Generate a response of the target length and format that responds to the user's question, summarizing all information in the input data tables appropriate for the response length and format, and incorporating any relevant general knowledge. 
+# If you don't know the answer, just say so. Do not make anything up.
+# Do not include information where the supporting evidence for it is not provided.
+
+# ---Target response length and format---
+
+# {response_type}
+
+# ---Data tables---
+
+# {context_data}
+
+# ---Instructions---
+
+# 1. Before generating the main response, list all the referenced content you will use in your response. Format each reference as follows:
+#    - [1]: "Referenced content 1 from the data tables."
+#    - [2]: "Referenced content 2 from the data tables."
+#    - ...
+#    Ensure the referenced content comes directly from the provided data tables.
+   
+# 2. After listing all references, generate the response. Use markdown formatting and include citation markers (e.g., [1], [2]) inline, corresponding to the previously listed references. The Reference entry should only use a citation marker at the beginning, and NO UNREALTED CITATION MARKERS SHOULD APPEAR! Response can only use the citation markers appeared in References.
+
+# ---Output Example---
+
+# ### References
+# - [1]: Example content from table A.
+# - [2]: Another example content from table B.
+
+# ### Response
+# Based on the data, the trends show an increase in revenue [1] and a decrease in expenses [2].
+# """
 
 PROMPTS["keywords_extraction"] = """---Role---
 

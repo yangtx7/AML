@@ -469,8 +469,8 @@ async def kg_query(
     cached_response, quantized, min_val, max_val = await handle_cache(
         hashing_kv, args_hash, query, query_param.mode
     )
-    if cached_response is not None:
-        return cached_response
+    # if cached_response is not None:
+    #     return cached_response
 
     example_number = global_config["addon_params"].get("example_number", None)
     if example_number and example_number < len(PROMPTS["keywords_extraction_examples"]):
