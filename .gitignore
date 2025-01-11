@@ -3,3 +3,5 @@ proj_2/data
 proj_2/lightrag.log
 proj_2/work_dirs
 proj_2/working_dir
+*.jsonl
+proj_4/data
